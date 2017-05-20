@@ -1,5 +1,6 @@
 const express = require('express');
 const bodyParser = require('body-parser');
+const cors = require('cors');
 const pgp = require('pg-promise')();
 const axios = require('axios');
 
@@ -10,6 +11,9 @@ const imageURL = 'http://image-mirror.gauntlet.moe';
 // Set up the app
 const app = express();
 app.use(bodyParser.json({ type: 'application/json' }));
+
+// Set up CORS library
+app.use(cors());
 
 // Set up the DB
 const db = pgp({
@@ -81,8 +85,6 @@ function createPosts(threadID, posts) {
     return `(${values.join(', ')})`;
   }).join(', ');
 
-  // console.log(postValues);
-
   return db.query(`
     INSERT INTO posts (
       chan_id, 
@@ -116,7 +118,7 @@ function getSingleThread(req, resp) {
           'img', p.img
         ))
         FROM posts p WHERE p.thread = t.id AND p.img IS NOT NULL)) json
-    FROM threads t
+    FROM threads t WHERE t.chan_id = ${req.params.chanID}
   `).then(data => {
     // Did we find the thread?
     if (data.length) {
@@ -171,7 +173,7 @@ function handleCreateThread(req, resp) {
           .map(post => (
             axios.post(imageURL, {
               url: `http://i.4cdn.org/${details.board}/${post.tim}${post.ext}`,
-              folder: id,
+              folder: details.thread,
             })
             .then(resp => resp.data)
           ));
@@ -196,7 +198,7 @@ function handleCreateThread(req, resp) {
 // Set up thread routes
 threadRouter.get('/', getThreads);
 threadRouter.post('/', handleCreateThread);
-threadRouter.get('/:id', getSingleThread);
+threadRouter.get('/:chanID', getSingleThread);
 
 // Add the thread router to the application
 app.use('/thread', threadRouter);
