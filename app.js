@@ -3,6 +3,10 @@ const bodyParser = require('body-parser');
 const pgp = require('pg-promise')();
 const axios = require('axios');
 
+// Config
+const proxyURL = 'http://proxy.gauntlet.moe';
+const imageURL = 'http://image-mirror.gauntlet.moe';
+
 // Set up the app
 const app = express();
 app.use(bodyParser.json({ type: 'application/json' }));
@@ -15,6 +19,56 @@ const db = pgp({
   user: 'jfree',
   password: '',
 });
+
+// Utility
+
+// Split the URL to get the board/ID
+function getThreadDetails(url) {
+  const split = url.replace('http://', '').split('/');
+
+  if (url.length < 2) return null;
+
+  return {
+    board: split[1],
+    thread: split[3],
+  };
+}
+
+function formatPosts(details, posts) {
+  return posts.map(post => ({
+    id: post.no,
+    name: post.name,
+    body: post.com,
+    img: `${post.tim}${post.ext}`,
+    // img: `http://i.4cdn.org/${details.board}/${post.tim}${post.ext}`,
+  }));
+}
+
+function createThread(details, posts) {
+  return db.query(`
+    INSERT INTO threads (
+      chan_id, 
+      board,
+      title,
+      timestamp,
+      posts,
+      img_root
+    ) 
+    VALUES (
+      ${parseInt(details.thread)},
+      '${details.board}',
+      '${posts[0] ? posts[0].sub : null}',
+      to_timestamp(${posts[0] ? posts[0].time : null}),
+      '${JSON.stringify(formatPosts(details, posts))}',
+      'http://i.4cdn.org/${details.board}/'
+    )
+    RETURNING id
+  `).then(data => data[0].id);
+}
+
+function mirrorImages() {
+
+}
 
 // Set up the thread router
 const threadRouter = express.Router();
@@ -42,7 +96,7 @@ function getSingleThread(req, resp) {
 }
 
 // Create a new thread from a 4chan URL
-function createThread(req, resp) {
+function handleCreateThread(req, resp) {
   // Were we passed a URL?
   if (!req.body.url) {
     resp.status(400).json({
@@ -51,46 +105,52 @@ function createThread(req, resp) {
     })
   }
 
-  // Split the URL to get the board/ID
-  const split = req.body.url.replace('http://', '').split('/');
-  const board = split[1];
-  const thread = split[3];
+  const details = getThreadDetails(req.body.url);
 
   // Get the proxied response
-  axios.get(`http://proxy.gauntlet.moe/http://a.4cdn.org/${board}/thread/${thread}.json`, {
+  axios.get(`${proxyURL}/http://a.4cdn.org/${details.board}/thread/${details.thread}.json`, {
     headers: {
       'X-Requested-With': true,
       'Content-Type': 'application/json',
     }
   }).then(proxyResp => {
-    if (proxyResp.data.posts) {
-      // console.log();
-      db.query(`
-        INSERT INTO threads (
-          chan_id, 
-          board,
-          timestamp,
-          posts
-        ) 
-        VALUES (
-          ${parseInt(thread)},
-          '${board}',
-          to_timestamp(${proxyResp.data.posts[0].time}),
-          '${JSON.stringify(proxyResp.data.posts)}'
-        )
-      `).then(() => {
+    if (!proxyResp.data.posts) return;
+
+    // Create a new thread
+    createThread(details, proxyResp.data.posts)
+      .then((id) => {
+        console.log(`The thread id is: ${id}`);
+        // Thread is created, return a response
         resp.status(200).json({
-          message: `Thread ${thread} added successfully`,
+          message: `Thread ${details.thread} added successfully`,
           data: proxyResp.data,
         });
+
+        // Image proxy promises
+        const imageRequests = proxyResp.data.posts
+          .filter(post => post.tim && post.ext)
+          .map(post => (
+            axios.get(`${imageURL}/http://i.4cdn.org/${details.board}/${post.tim}${post.ext}`)
+              .then(resp => resp.data)
+          ));
+
+        // Update thread JSON
+        axios.all(imageRequests).then(() => {
+          db.query(`
+            UPDATE threads
+            SET img_root = 'https://s3-us-west-1.amazonaws.com/gauntlet-images/'
+            WHERE id = ${id}
+           `);
+        });
+
       }).catch(error => resp.status(500).json({ error }));
-    }
-  }).catch(error => resp.status(500).json({ error, url: `http://proxy.gauntlet.moe/${req.body.url}`, }));
+
+  }).catch(error => resp.status(500).json({ error, url: `${proxyURL}/http://a.4cdn.org/${details.board}/thread/${details.thread}.json`, }));
 }
 
 // Set up thread routes
 threadRouter.get('/', getThreads);
-threadRouter.post('/', createThread);
+threadRouter.post('/', handleCreateThread);
 threadRouter.get('/:id', getSingleThread);
 
 // Add the thread router to the application
