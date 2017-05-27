@@ -101,7 +101,11 @@ const threadRouter = express.Router();
 
 // Get all threads
 function getThreads(req, resp) {
-  db.query('SELECT * FROM threads').then(data => {
+  db.query(`
+    SELECT threads.*,
+    (SELECT COUNT(id) AS post_count FROM posts WHERE posts.thread = threads.id AND posts.img IS NOT NULL)
+    FROM threads
+  `).then(data => {
     // Restructure from an Array into an Object with chan_id as the key
     const byID = Object.assign({}, ...data.map(thread => ({ [thread.chan_id]: thread })));
     resp.status(200).json(byID);
