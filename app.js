@@ -28,7 +28,7 @@ const db = pgp({
 function getThreadDetails(url) {
   const split = url.replace('http://', '').split('/');
 
-  if (url.length < 2) return null;
+  if (split.length < 2) return null;
 
   return {
     board: split[1],
@@ -65,8 +65,6 @@ function createThread(details, posts) {
     )
     RETURNING id
   `).then(data => data[0].id);
-
-  // '${JSON.stringify(formatPosts(details, posts))}',
 }
 
 // Inserts a set of posts (from a thread) into the DB
@@ -104,15 +102,23 @@ const threadRouter = express.Router();
 // Get all threads
 function getThreads(req, resp) {
   db.query('SELECT * FROM threads').then(data => {
-    resp.status(200).json(data);
+    // Restructure from an Array into an Object with chan_id as the key
+    const byID = Object.assign({}, ...data.map(thread => ({ [thread.chan_id]: thread })));
+    resp.status(200).json(byID);
   });
 }
 
 // Get thread by ID
 function getSingleThread(req, resp) {
   db.query(`
-    SELECT json_build_object('thread_id', t.id, 'posts',
-        (SELECT json_agg(json_build_object(
+    SELECT json_build_object(
+      'thread_id', t.id,
+      'board', t.board,
+      'timestamp', t.timestamp,
+      'chan_id', t.chan_id,
+      'title', t.title,
+      'img_root', t.img_root,
+      'posts', (SELECT json_agg(json_build_object(
           'post_id', p.id, 
           'body', p.body,
           'img', p.img
@@ -138,13 +144,21 @@ function getSingleThread(req, resp) {
 function handleCreateThread(req, resp) {
   // Were we passed a URL?
   if (!req.body.url) {
-    resp.status(400).json({
+    return resp.status(400).json({
       status: 400,
       message: 'No thread URL provided.',
     })
   }
 
+  // Extract board/thread details from URL
   const details = getThreadDetails(req.body.url);
+
+  if (!details) {
+    return resp.status(400).json({
+      status: 400,
+      message: 'Is it a valid URL?',
+    });
+  }
 
   // Get the proxied response
   axios.get(`${proxyURL}/http://a.4cdn.org/${details.board}/thread/${details.thread}.json`, {
@@ -158,12 +172,6 @@ function handleCreateThread(req, resp) {
     // Create a new thread
     createThread(details, proxyResp.data.posts)
       .then((id) => {
-        // Thread is created, return a response
-        resp.status(200).json({
-          message: `Thread ${details.thread} added successfully`,
-          data: proxyResp.data,
-        });
-
         // Create the posts
         createPosts(id, proxyResp.data.posts);
 
@@ -188,11 +196,23 @@ function handleCreateThread(req, resp) {
             SET img_root = '${newRoot}'
             WHERE id = ${id}
            `);
+
+          // Thread is created, return a response
+          resp.status(200).json({
+            message: `Thread ${details.thread} added successfully`,
+            data: proxyResp.data,
+            thread_id: id,
+            chan_id: details.thread,
+          });
         });
 
       }).catch(error => resp.status(500).json({ error }));
-
-  }).catch(error => resp.status(500).json({ error, url: `${proxyURL}/http://a.4cdn.org/${details.board}/thread/${details.thread}.json`, }));
+  }).catch(error => {
+    return resp.status(500).json({
+      error,
+      url: `${proxyURL}/http://a.4cdn.org/${details.board}/thread/${details.thread}.json`,
+    });
+  });
 }
 
 // Set up thread routes
