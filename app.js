@@ -103,7 +103,7 @@ const threadRouter = express.Router();
 function getThreads(req, resp) {
   db.query(`
     SELECT threads.*,
-    (SELECT COUNT(id) AS post_count FROM posts WHERE posts.thread = threads.id AND posts.img IS NOT NULL)
+    (SELECT COUNT(id) AS post_count FROM posts WHERE posts.thread = threads.id)
     FROM threads
   `).then(data => {
     // Restructure from an Array into an Object with chan_id as the key
@@ -127,12 +127,11 @@ function getSingleThread(req, resp) {
           'body', p.body,
           'img', p.img
         ))
-        FROM posts p WHERE p.thread = t.id AND p.img IS NOT NULL)) json
+        FROM posts p WHERE p.thread = t.id)) json
     FROM threads t WHERE t.chan_id = ${req.params.chanID}
   `).then(data => {
     // Did we find the thread?
     if (data.length) {
-      // TODO: Should be able to just return the JSON object ('data')
       // This is a hacky way of clearing out the wrappers
       resp.status(200).json(data[0].json);
     } else {
@@ -173,15 +172,17 @@ function handleCreateThread(req, resp) {
   }).then(proxyResp => {
     if (!proxyResp.data.posts) return;
 
+    // Filter out posts without images
+    const withImages = proxyResp.data.posts.filter(p => p.filename);
+
     // Create a new thread
-    createThread(details, proxyResp.data.posts)
+    createThread(details, withImages)
       .then((id) => {
         // Create the posts
-        createPosts(id, proxyResp.data.posts);
+        createPosts(id, withImages);
 
         // Image proxy promises
-        const imageRequests = proxyResp.data.posts
-          .filter(post => post.tim && post.ext)
+        const imageRequests = withImages
           .map(post => (
             axios.post(imageURL, {
               url: `http://i.4cdn.org/${details.board}/${post.tim}${post.ext}`,
