@@ -196,6 +196,16 @@ function handleCreateThread(req, resp) {
           // Presume the bucket is consistent, just grab it from the first image
           const newRoot = imageResponses[0]['img_root'];
 
+          const imageValues = imageResponses.map((imgResp) => {
+            return `('${imgResp.url}')`;
+          }).join(', ');
+
+          db.query(`
+            INSERT INTO images (original) 
+            VALUES ${imageValues}
+            RETURNING id
+          `);
+
           db.query(`
             UPDATE threads
             SET img_root = '${newRoot}'
