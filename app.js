@@ -2,7 +2,7 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const cors = require('cors');
 const pgp = require('pg-promise')();
-const axios = require('axios');
+const fetch = require('node-fetch');
 
 // Config
 const proxyURL = 'http://proxy.gauntlet.moe';
@@ -36,41 +36,41 @@ function getThreadDetails(url) {
   };
 }
 
-function formatPosts(threadID, posts) {
-  return posts.map(post => ({
-    chan_id: post.no,
+function formatPosts(threadID, imageIDs, posts) {
+  return posts.map((post, i) => ({
     thread: threadID,
+    image: imageIDs[i],
+    chan_id: post.no,
     body: post.com,
-    img: post.tim ? `${post.tim}${post.ext}` : undefined,
     author: post.name,
   }));
 }
 
 // Inserts a new thread into the DB
-function createThread(details, posts) {
+function createThread(details, posts, imageCoverID) {
   return db.query(`
     INSERT INTO threads (
       chan_id, 
       board,
       title,
       timestamp,
-      img_root
+      cover
     ) 
     VALUES (
       ${parseInt(details.thread)},
       '${details.board}',
-      '${posts[0] ? posts[0].sub : null}',
+      '${posts[0] ? posts[0].sub : "Untitled"}',
       to_timestamp(${posts[0] ? posts[0].time : null}),
-      'http://i.4cdn.org/${details.board}/'
+      ${imageCoverID}
     )
     RETURNING id
   `).then(data => data[0].id);
 }
 
 // Inserts a set of posts (from a thread) into the DB
-function createPosts(threadID, posts) {
+function createPosts(threadID, imageIDs, posts) {
   // Convert the post object into a set of values (string) to be inserted
-  const postValues = formatPosts(threadID, posts).map((post) => {
+  const postValues = formatPosts(threadID, imageIDs, posts).map((post) => {
     const values = Object.keys(post).map(postKey => {
       // If it's a string, we'll need to wrap it in quotes for the DB Query
       if (typeof post[postKey] === 'string') return `'${post[postKey]}'`;
@@ -85,15 +85,44 @@ function createPosts(threadID, posts) {
 
   return db.query(`
     INSERT INTO posts (
-      chan_id, 
       thread,
-      body,
       img,
+      chan_id, 
+      body,
       author
     ) 
     VALUES ${postValues}
     RETURNING id
   `).then(data => data[0].id);
+}
+
+function createImages(details, posts) {
+  // Image proxy promises
+  const imageRequests = posts
+    .map(post => (
+      fetch(imageURL, {
+        method: 'POST',
+        headers: new fetch.Headers({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+          url: `http://i.4cdn.org/${details.board}/${post.tim}${post.ext}`,
+          folder: details.thread,
+        }),
+      })
+        .then(resp => resp.json())
+    ));
+
+  // Update thread JSON
+  return Promise.all(imageRequests).then((imageResponses) => {
+    const imageValues = imageResponses.map((imgResp) => {
+      return `('${imgResp.url}')`;
+    }).join(', ');
+
+    return db.query(`
+        INSERT INTO images (original) 
+        VALUES ${imageValues}
+        RETURNING id
+      `).then(resp => resp.map(img => img.id));
+  });
 }
 
 // Set up the thread router
@@ -102,7 +131,8 @@ const threadRouter = express.Router();
 // Get all threads
 function getThreads(req, resp) {
   db.query(`
-    SELECT threads.*,
+    SELECT id, board, timestamp, chan_id, title,
+    (SELECT original AS cover FROM images WHERE threads.cover = id),
     (SELECT COUNT(id) AS post_count FROM posts WHERE posts.thread = threads.id)
     FROM threads
   `).then(data => {
@@ -121,11 +151,12 @@ function getSingleThread(req, resp) {
       'timestamp', t.timestamp,
       'chan_id', t.chan_id,
       'title', t.title,
-      'img_root', t.img_root,
+      'cover', (SELECT original FROM images WHERE t.cover = images.id),
+      'post_count', (SELECT COUNT(id) FROM posts WHERE posts.thread = t.id),
       'posts', (SELECT json_agg(json_build_object(
           'post_id', p.id, 
           'body', p.body,
-          'img', p.img
+          'img', (SELECT original FROM images WHERE id = p.img)
         ))
         FROM posts p WHERE p.thread = t.id)) json
     FROM threads t WHERE t.chan_id = ${req.params.chanID}
@@ -143,6 +174,22 @@ function getSingleThread(req, resp) {
   });
 }
 
+function imageValues(imageResponses) {
+  return imageResponses.map((imgResp) => {
+    return `('${imgResp.url}')`;
+  }).join(', ');
+}
+
+function getProxiedThread(details) {
+  return fetch(`${proxyURL}/http://a.4cdn.org/${details.board}/thread/${details.thread}.json`, {
+    method: 'GET',
+    headers: new fetch.Headers({
+      'X-Requested-With': 'api',
+      'Content-Type': 'application/json',
+    }),
+  }).then(proxyResp => proxyResp.json());
+}
+
 // Create a new thread from a 4chan URL
 function handleCreateThread(req, resp) {
   // Were we passed a URL?
@@ -156,6 +203,7 @@ function handleCreateThread(req, resp) {
   // Extract board/thread details from URL
   const details = getThreadDetails(req.body.url);
 
+  // Exit if we couldn't extract any details
   if (!details) {
     return resp.status(400).json({
       status: 400,
@@ -164,64 +212,26 @@ function handleCreateThread(req, resp) {
   }
 
   // Get the proxied response
-  axios.get(`${proxyURL}/http://a.4cdn.org/${details.board}/thread/${details.thread}.json`, {
-    headers: {
-      'X-Requested-With': true,
-      'Content-Type': 'application/json',
-    }
-  }).then(proxyResp => {
-    if (!proxyResp.data.posts) return;
-
+  getProxiedThread(details).then((proxyResp) => {
     // Filter out posts without images
-    const withImages = proxyResp.data.posts.filter(p => p.filename);
+    const filteredPosts = proxyResp.posts.filter(p => p.filename);
 
-    // Create a new thread
-    createThread(details, withImages)
-      .then((id) => {
-        // Create the posts
-        createPosts(id, withImages);
-
-        // Image proxy promises
-        const imageRequests = withImages
-          .map(post => (
-            axios.post(imageURL, {
-              url: `http://i.4cdn.org/${details.board}/${post.tim}${post.ext}`,
-              folder: details.thread,
-            })
-            .then(resp => resp.data)
-          ));
-
-        // Update thread JSON
-        axios.all(imageRequests).then((imageResponses) => {
-          // Presume the bucket is consistent, just grab it from the first image
-          const newRoot = imageResponses[0]['img_root'];
-
-          const imageValues = imageResponses.map((imgResp) => {
-            return `('${imgResp.url}')`;
-          }).join(', ');
-
-          db.query(`
-            INSERT INTO images (original) 
-            VALUES ${imageValues}
-            RETURNING id
-          `);
-
-          db.query(`
-            UPDATE threads
-            SET img_root = '${newRoot}'
-            WHERE id = ${id}
-           `);
-
-          // Thread is created, return a response
-          resp.status(200).json({
-            message: `Thread ${details.thread} added successfully`,
-            data: proxyResp.data,
-            thread_id: id,
-            chan_id: details.thread,
+    // TODO: This is pretty ugly
+    createImages(details, filteredPosts)
+      .then((imageIDs) => {
+        createThread(details, filteredPosts, imageIDs[0])
+          .then((threadID) => {
+             createPosts(threadID, imageIDs, filteredPosts)
+               .then(() => {
+                 resp.status(200).json({
+                   message: `Thread ${details.thread} added successfully`,
+                   thread_id: threadID,
+                   chan_id: details.thread,
+                 });
+               });
           });
-        });
+      });
 
-      }).catch(error => resp.status(500).json({ error }));
   }).catch(error => {
     return resp.status(500).json({
       error,
