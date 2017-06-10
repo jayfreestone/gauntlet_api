@@ -113,12 +113,16 @@ function createImages(details, posts) {
 
   // Update thread JSON
   return Promise.all(imageRequests).then((imageResponses) => {
-    const imageValues = imageResponses.map((imgResp) => {
-      return `('${imgResp.url}')`;
+    const imageValues = imageResponses.map((imgResp, i) => {
+      return `('${imgResp.url}', ${posts[i].w}, ${posts[i].h})`;
     }).join(', ');
 
     return db.query(`
-        INSERT INTO images (original) 
+        INSERT INTO images (
+          original,
+          width,
+          height
+        ) 
         VALUES ${imageValues}
         RETURNING id
       `).then(resp => resp.map(img => img.id));
@@ -156,7 +160,9 @@ function getSingleThread(req, resp) {
       'posts', (SELECT json_agg(json_build_object(
           'post_id', p.id, 
           'body', p.body,
-          'img', (SELECT original FROM images WHERE id = p.img)
+          'img', (SELECT original FROM images WHERE id = p.img),
+          'width', (SELECT width FROM images WHERE id = p.img),
+          'height', (SELECT height FROM images WHERE id = p.img)
         ))
         FROM posts p WHERE p.thread = t.id)) json
     FROM threads t WHERE t.chan_id = ${req.params.chanID}
